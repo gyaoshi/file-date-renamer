@@ -1,0 +1,20 @@
+# 构建产物
+dist/
+build/
+*.spec
+__pycache__/
+*.pyc
+
+# 主程序：以 Release 附件形式分发，不进版本库
+RenameTime.exe
+
+# 测试临时目录
+test_sandbox/
+cli_test/
+shellexec_test/
+motw_test/
+status_out.txt
+reg_out.txt
+
+# Agent 工作区数据（不属于项目源码）
+.workbuddy/
