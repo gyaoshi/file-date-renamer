@@ -47,10 +47,17 @@ import shlex
 import sys
 import time
 
+import i18n
+
 APP_NAME = "RenameTime"
+APP_VERSION = "1.1.0"
 VERB_KEY_NAME = "RenameTime"            # 注册表 verb 键名（保持 ASCII）
-DEFAULT_VERB_TEXT = "添加日期前缀"
 MAX_HISTORY = 50
+
+
+def default_verb_text():
+    """右键菜单默认文案（随界面语言变化）。"""
+    return i18n.tr("verb.default")
 
 # ---------------------------------------------------------------------------
 # 配置
@@ -77,24 +84,47 @@ DEFAULT_CONFIG = {
     # 运行方式
     "direct_mode": True,                # 右键菜单点击后直接执行（不弹预览）
     "show_result": True,                # 执行后显示结果窗口
+    # 历史
+    "record_history": True,             # 是否记录重命名历史（用于撤销）
     # 右键菜单
-    "verb_text": DEFAULT_VERB_TEXT,     # 菜单显示文字
+    "verb_text": "",                    # 菜单显示文字（留空则跟随界面语言）
     "register_background": False,       # 是否注册「文件夹空白处」右键
+    # 语言
+    "language": i18n.DEFAULT_LANG,      # 界面语言 zh / en / ja / ru
 }
 
-# 日期格式预设：（下拉显示文本, date_format, include_time, time_sep）
+# 日期格式预设：(date_format, include_time, time_sep)
+# 下拉框里显示的示例文字按当前界面语言动态生成（见 format_preset_label）
 FORMAT_PRESETS = [
-    ("20151010 某某文件.pdf", "%Y%m%d", "none", "_"),
-    ("2015-10-10 某某文件.pdf", "%Y-%m-%d", "none", "_"),
-    ("2015_10_10 某某文件.pdf", "%Y_%m_%d", "none", "_"),
-    ("2015.10.10 某某文件.pdf", "%Y.%m.%d", "none", "_"),
-    ("2015年10月10日 某某文件.pdf", "%Y年%m月%d日", "none", "_"),
-    ("151010 某某文件.pdf", "%y%m%d", "none", "_"),
-    ("20151010_1430 某某文件.pdf", "%Y%m%d", "hm", "_"),
-    ("2015-10-10 14-30-05 某某文件.pdf", "%Y-%m-%d", "hms", " "),
+    ("%Y%m%d", "none", "_"),
+    ("%Y-%m-%d", "none", "_"),
+    ("%Y_%m_%d", "none", "_"),
+    ("%Y.%m.%d", "none", "_"),
+    ("%Y年%m月%d日", "none", "_"),
+    ("%y%m%d", "none", "_"),
+    ("%Y%m%d", "hm", "_"),
+    ("%Y-%m-%d", "hms", " "),
 ]
 
 SAMPLE_DT = datetime.datetime(2015, 10, 10, 14, 30, 5)
+
+
+def sample_file_name():
+    return i18n.tr("sample.file_name")
+
+
+def sample_dir_name():
+    return i18n.tr("sample.dir_name")
+
+
+def format_preset_label(date_format, time_mode, time_sep):
+    """把预设渲染成当前语言下的示例文字，如「20151010 Sample Document.pdf」。"""
+    cfg = {"date_format": date_format, "include_time": time_mode, "time_sep": time_sep}
+    return "%s %s" % (build_stamp(SAMPLE_DT, cfg), sample_file_name())
+
+
+def format_preset_choices():
+    return [format_preset_label(*spec) for spec in FORMAT_PRESETS]
 
 
 def app_dir():
@@ -179,12 +209,80 @@ def try_become_leader():
         return False
 
 
-def collect_batch(quiet=1.0, cap=25.0):
+def _sibling_count():
+    """统计当前仍在运行的同类进程数（排除自己这一家）。
+
+    打包后的 exe 用它判断“还有进程正在启动”：
+      0   → 只剩自己这一家，说明其它进程都已投递完毕，可以立即执行；
+      >0  → 还有别的进程在解压启动中，继续等。
+    源码运行时无法可靠识别同类进程（都是 python.exe），返回 -1 表示“未知”。
+
+    注意排除“自己这一家”：PyInstaller onefile 会派生一个同名的父进程，
+    它与子进程是同一次调用，若计入会导致主控永远等不到 0 而空耗到 cap 上限。
+    """
+    if not getattr(sys, "frozen", False):
+        return -1
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        class PROCESSENTRY32W(ctypes.Structure):
+            _fields_ = [
+                ("dwSize", wintypes.DWORD),
+                ("cntUsage", wintypes.DWORD),
+                ("th32ProcessID", wintypes.DWORD),
+                ("th32DefaultHeapID", ctypes.c_size_t),
+                ("th32ModuleID", wintypes.DWORD),
+                ("cntThreads", wintypes.DWORD),
+                ("th32ParentProcessID", wintypes.DWORD),
+                ("pcPriClassBase", wintypes.LONG),
+                ("dwFlags", wintypes.DWORD),
+                ("szExeFile", ctypes.c_wchar * 260),
+            ]
+
+        k32 = ctypes.windll.kernel32
+        TH32CS_SNAPPROCESS = 0x00000002
+        INVALID_HANDLE_VALUE = -1
+        me = os.getpid()
+        target = os.path.basename(sys.executable).lower()
+        snap = k32.CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
+        if snap == INVALID_HANDLE_VALUE:
+            return -1
+        try:
+            pe = PROCESSENTRY32W()
+            pe.dwSize = ctypes.sizeof(PROCESSENTRY32W)
+            mine = []                       # 自己这一家：自己 + 同名的父/子进程
+            others = 0
+            if k32.Process32FirstW(snap, ctypes.byref(pe)):
+                while True:
+                    pid = int(pe.th32ProcessID)
+                    ppid = int(pe.th32ParentProcessID)
+                    same = pe.szExeFile.lower() == target
+                    if pid == me:
+                        mine.append(pid)
+                    elif same and (ppid == me or pid in mine):
+                        mine.append(pid)      # 父进程或子进程，同属一次调用
+                    elif same:
+                        others += 1
+                    if not k32.Process32NextW(snap, ctypes.byref(pe)):
+                        break
+            return others
+        finally:
+            k32.CloseHandle(snap)
+    except Exception:
+        return -1
+
+
+def collect_batch(quiet=1.0, cap=15.0):
     """主控进程：等待其它进程投递完毕后取走整批路径。
 
     资源管理器多选时每个文件各启动一个进程，这里等待“队列不再增长”一段时间，
     收齐全部路径后清空队列与锁，返回整批路径。
-    若个别进程启动过慢超出上限，它们会在锁释放后自己成为下一批的主控，不会漏改。
+
+    只靠“静默时间”不够：exe 冷启动要解压 2~3 秒，进程启动时刻天然离散，
+    队列可能中间静默超过 1 秒就被误判为结束。因此额外用 _sibling_count() 判断
+    是否还有同类进程正在启动——只要还有，就继续等（直到 cap 上限）。
+    个别进程启动过慢超出上限的，它们会在锁释放后自己成为下一批的主控，不会漏改。
     """
     t0 = last_change = time.time()
     last_n = -1
@@ -194,7 +292,12 @@ def collect_batch(quiet=1.0, cap=25.0):
         if n != last_n:
             last_n, last_change = n, now
         elif now - last_change >= quiet:
-            break
+            sib = _sibling_count()
+            if sib <= 0:          # 未知(-1)或确认只剩自己 → 可以执行
+                break
+            # 还有同类进程在启动，继续等；每0.5s 重查一次
+            if now - last_change >= quiet + 0.5:
+                last_change = now - quiet + 0.05
         time.sleep(0.12)
     paths = read_queue()
     for p in (_queue_path(), _lock_path()):  # 先清空再执行，避免崩溃后残留
@@ -210,6 +313,7 @@ def log_path():
 
 
 def load_config():
+    """读取配置，并把界面语言应用到全局 i18n 状态。"""
     cfg = dict(DEFAULT_CONFIG)
     try:
         with open(config_path(), "r", encoding="utf-8") as f:
@@ -217,8 +321,10 @@ def load_config():
         if isinstance(data, dict):
             cfg.update({k: v for k, v in data.items() if k in DEFAULT_CONFIG})
     except Exception:
-        pass
+        # 首次运行：用系统语言环境决定初始界面语言
+        cfg["language"] = i18n.detect_lang()
     _validate(cfg)
+    i18n.set_lang(cfg["language"])
     return cfg
 
 
@@ -248,8 +354,10 @@ def _validate(cfg):
         cfg["conflict"] = "suffix"
     if cfg.get("scope") not in ("both", "files", "folders"):
         cfg["scope"] = "both"
-    if not cfg.get("verb_text"):
-        cfg["verb_text"] = DEFAULT_VERB_TEXT
+    if not i18n.is_supported(cfg.get("language", "")):
+        cfg["language"] = i18n.DEFAULT_LANG
+    if cfg.get("verb_text") is None:
+        cfg["verb_text"] = ""
     try:
         cfg["seq_digits"] = max(1, min(6, int(cfg.get("seq_digits", 3))))
     except Exception:
@@ -471,14 +579,14 @@ def collect_targets(paths, cfg):
         seen.add(key)
         exists = os.path.exists(p)
         is_dir = os.path.isdir(p) if exists else False
-        reason = None
+        reason_key = None
         if not exists:
-            reason = "路径不存在"
+            reason_key = "reason.not_exist"
         elif not allowed(is_dir):
-            reason = "按设置跳过该类型"
+            reason_key = "reason.type_scope"
         elif is_hidden_or_system(p) and not include_hidden:
-            reason = "隐藏/系统项，按设置跳过"
-        items.append({"path": p, "is_dir": is_dir, "skip": reason})
+            reason_key = "reason.hidden"
+        items.append({"path": p, "is_dir": is_dir, "skip": reason_key})
 
     for p in paths:
         p0 = os.path.abspath(p)
@@ -499,8 +607,15 @@ def collect_targets(paths, cfg):
     return items
 
 
+def skip_plan(path, is_dir, name, reason_key, reason_args=()):
+    """构造一条“跳过”计划。reason_key 用于按界面语言显示，reason 保留日志用的中文。"""
+    return dict(path=path, new_path="", is_dir=is_dir, old_name=name, new_name="",
+                status="skip", reason_key=reason_key, reason_args=tuple(reason_args),
+                reason=i18n.tr(reason_key, *reason_args), checked=False)
+
+
 def build_plans(items, cfg):
-    """生成重命名计划。每个计划: path/new_path/is_dir/old_name/new_name/status/reason"""
+    """生成重命名计划。每个计划: path/new_path/is_dir/old_name/new_name/status/reason_key"""
     exclude_exts = parse_exclude_exts(cfg.get("exclude_exts", ""))
     plans = []
     seq = 0
@@ -510,31 +625,23 @@ def build_plans(items, cfg):
         name = os.path.basename(path.rstrip("\\/")) or path
 
         if it["skip"]:
-            plans.append(dict(path=path, new_path="", is_dir=is_dir,
-                              old_name=name, new_name="", status="skip",
-                              reason=it["skip"], checked=False))
+            plans.append(skip_plan(path, is_dir, name, it["skip"]))
             continue
 
         root, ext = (name, "") if is_dir else os.path.splitext(name)
         if ext.lower() in exclude_exts:
-            plans.append(dict(path=path, new_path="", is_dir=is_dir,
-                              old_name=name, new_name="", status="skip",
-                              reason="扩展名在排除列表中", checked=False))
+            plans.append(skip_plan(path, is_dir, name, "reason.ext_excluded"))
             continue
 
         existing = leading_date_token(name)
         if existing and cfg.get("existing_date") == "skip":
-            plans.append(dict(path=path, new_path="", is_dir=is_dir,
-                              old_name=name, new_name="", status="skip",
-                              reason="文件名已包含日期前缀", checked=False))
+            plans.append(skip_plan(path, is_dir, name, "reason.has_date"))
             continue
 
         try:
             dt = file_datetime(path, cfg)
         except OSError as e:
-            plans.append(dict(path=path, new_path="", is_dir=is_dir,
-                              old_name=name, new_name="", status="skip",
-                              reason="读取日期失败: %s" % e, checked=False))
+            plans.append(skip_plan(path, is_dir, name, "reason.read_fail", (str(e),)))
             continue
 
         base = root
@@ -555,18 +662,14 @@ def build_plans(items, cfg):
 
         new_name = new_base + ext
         if new_name == name:
-            plans.append(dict(path=path, new_path="", is_dir=is_dir,
-                              old_name=name, new_name="", status="skip",
-                              reason="名称未变化", checked=False))
+            plans.append(skip_plan(path, is_dir, name, "reason.same_name"))
             continue
 
         parent = os.path.dirname(path)
         new_path = os.path.join(parent, new_name)
         if os.path.exists(new_path) and os.path.normcase(new_path) != os.path.normcase(path):
             if cfg.get("conflict") == "skip":
-                plans.append(dict(path=path, new_path="", is_dir=is_dir,
-                                  old_name=name, new_name="", status="skip",
-                                  reason="目标已存在，按设置跳过", checked=False))
+                plans.append(skip_plan(path, is_dir, name, "reason.target_exists"))
                 continue
             i = 1
             while i <= 999:
@@ -597,7 +700,8 @@ def execute_plans(plans, cfg, use_check=True):
         if pl["status"] != "ok" or (use_check and not pl.get("checked", True)):
             pl["status"] = pl["status"] if pl["status"] != "ok" else "skip"
             if not pl.get("reason"):
-                pl["reason"] = "未勾选，跳过"
+                pl["reason_key"] = "reason.uncheck"
+                pl["reason"] = i18n.tr("reason.uncheck")
             skip += 1
             results.append(pl)
             continue
@@ -614,11 +718,22 @@ def execute_plans(plans, cfg, use_check=True):
         results.append(pl)
 
     if done_items:
-        History().add_batch(done_items)
+        if cfg.get("record_history", True):
+            History().add_batch(done_items)
+        else:
+            append_launch_log("  已关闭历史记录，本次 %d 项不入撤销历史" % len(done_items))
         write_log(["成功 %d / 跳过 %d / 失败 %d" % (ok, skip, err)] +
                   ["%s -> %s" % (os.path.basename(d["old"]), os.path.basename(d["new"]))
                    for d in done_items])
     return {"ok": ok, "skip": skip, "error": err, "results": results}
+
+
+def plan_reason(pl):
+    """取计划的显示原因（按当前界面语言）。"""
+    key = pl.get("reason_key")
+    if key:
+        return i18n.tr(key, *pl.get("reason_args", ()))
+    return pl.get("reason", "")
 
 
 # ---------------------------------------------------------------------------
@@ -659,6 +774,14 @@ class History(object):
         if 0 <= index < len(self.batches):
             del self.batches[index]
             self.save()
+
+    def clear(self):
+        """清空全部历史，返回被删除的批次数。"""
+        n = len(self.batches)
+        self.batches = []
+        self.save()
+        append_launch_log("  历史已清空：%d 批" % n)
+        return n
 
 
 def undo_batch(batch):
@@ -762,37 +885,38 @@ def register_context_menu(cfg=None):
     cmd_files, cmd_bg = launcher_commands()
     icon = icon_path()
     keys = _verb_key_paths()
+    verb_text = (cfg.get("verb_text") or "").strip() or default_verb_text()
     msgs = []
     try:
-        _set_verb(keys["files"], cfg.get("verb_text", DEFAULT_VERB_TEXT), cmd_files, icon)
-        msgs.append("已注册：所有文件的右键菜单")
-        _set_verb(keys["dirs"], cfg.get("verb_text", DEFAULT_VERB_TEXT), cmd_files, icon)
-        msgs.append("已注册：文件夹的右键菜单")
+        _set_verb(keys["files"], verb_text, cmd_files, icon)
+        msgs.append(i18n.tr("reg.files"))
+        _set_verb(keys["dirs"], verb_text, cmd_files, icon)
+        msgs.append(i18n.tr("reg.dirs"))
         if cfg.get("register_background"):
-            _set_verb(keys["background"], cfg.get("verb_text", DEFAULT_VERB_TEXT),
-                      cmd_bg, icon)
-            msgs.append("已注册：文件夹空白处右键")
+            _set_verb(keys["background"], verb_text, cmd_bg, icon)
+            msgs.append(i18n.tr("reg.bg"))
         else:
             import winreg
             _reg_delete_tree(winreg.HKEY_CURRENT_USER, keys["background"])
         return True, msgs
     except Exception as e:
-        return False, ["注册失败: %s" % e]
+        return False, [i18n.tr("reg.fail", str(e))]
 
 
 def unregister_context_menu():
     """注销右键菜单。返回 (成功标志, 信息列表)。"""
     import winreg
     hkcu = winreg.HKEY_CURRENT_USER
-    msgs = []
+    labels = {"files": "unreg.files", "dirs": "unreg.dirs", "background": "unreg.bg"}
     ok = True
+    msgs = []
     for name, path in _verb_key_paths().items():
         try:
             _reg_delete_tree(hkcu, path)
-            msgs.append("已移除：%s" % path)
+            msgs.append(i18n.tr(labels.get(name, "reg.files")))
         except Exception as e:
             ok = False
-            msgs.append("移除失败 %s: %s" % (path, e))
+            msgs.append(i18n.tr("reg.fail", str(e)))
     return ok, msgs
 
 
@@ -820,6 +944,8 @@ except Exception:  # 无 GUI 环境时仅提供命令行能力
 
 if wx is not None:
 
+    _GREY = (0x60, 0x60, 0x60)
+
     class _Page(wx.Panel):
         """设置页基类：收集控件值 / 回填控件值。"""
 
@@ -835,86 +961,86 @@ if wx is not None:
         def __init__(self, parent):
             super().__init__(parent)
             self.ctl = {}
+            tr = i18n.tr
             box = wx.BoxSizer(wx.VERTICAL)
 
             # 日期来源
-            sb = wx.StaticBox(self, label="日期来源")
+            sb = wx.StaticBox(self, label=tr("basic.source"))
             sbs = wx.StaticBoxSizer(sb, wx.VERTICAL)
             row = wx.BoxSizer(wx.HORIZONTAL)
             self.ctl["date_source"] = {}
-            for val, label in (("created", "创建日期"), ("modified", "修改日期"),
-                               ("accessed", "访问日期")):
-                rb = wx.RadioButton(self, label=label, style=wx.RB_GROUP if val == "created" else 0)
+            for val, key in (("created", "src.created"), ("modified", "src.modified"),
+                             ("accessed", "src.accessed")):
+                rb = wx.RadioButton(sb, label=tr(key),
+                                    style=wx.RB_GROUP if val == "created" else 0)
                 self.ctl["date_source"][val] = rb
                 row.Add(rb, 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 16)
             sbs.Add(row, 0, wx.EXPAND | wx.ALL, 6)
             box.Add(sbs, 0, wx.EXPAND | wx.ALL, 8)
 
             # 日期格式
-            sb = wx.StaticBox(self, label="日期格式（选择预设，或直接输入 strftime 代码）")
+            sb = wx.StaticBox(self, label=tr("basic.format"))
             sbs = wx.StaticBoxSizer(sb, wx.VERTICAL)
-            self.ctl["date_format"] = wx.ComboBox(
-                self, value="%Y%m%d",
-                choices=[p[0] for p in FORMAT_PRESETS])
+            self.ctl["date_format"] = wx.ComboBox(sb, value="%Y%m%d")
             self.ctl["date_format"].Bind(wx.EVT_COMBOBOX, self.on_preset)
             sbs.Add(self.ctl["date_format"], 0, wx.EXPAND | wx.ALL, 6)
-            hint = wx.StaticText(
-                self, label="可用代码：%Y 年(4位)  %y 年(2位)  %m 月  %d 日  %H 时  %M 分  %S 秒  %j 年积日\n"
-                            "中文可直接输入“年月日”，如：%Y年%m月%d日")
-            hint.SetForegroundColour(wx.Colour(0x60, 0x60, 0x60))
+            hint = wx.StaticText(sb, label=tr("basic.format.hint"))
+            hint.SetForegroundColour(wx.Colour(*_GREY))
             sbs.Add(hint, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 6)
             box.Add(sbs, 0, wx.EXPAND | wx.ALL, 8)
 
             # 时间
-            sb = wx.StaticBox(self, label="是否包含时间")
+            sb = wx.StaticBox(self, label=tr("basic.time"))
             sbs = wx.StaticBoxSizer(sb, wx.VERTICAL)
             row = wx.BoxSizer(wx.HORIZONTAL)
             self.ctl["include_time"] = {}
-            for val, label in (("none", "不包含"), ("hm", "时分(1430)"), ("hms", "时分秒(14-30-05)")):
-                rb = wx.RadioButton(self, label=label, style=wx.RB_GROUP if val == "none" else 0)
+            for val, key in (("none", "time.none"), ("hm", "time.hm"), ("hms", "time.hms")):
+                rb = wx.RadioButton(sb, label=tr(key),
+                                    style=wx.RB_GROUP if val == "none" else 0)
                 self.ctl["include_time"][val] = rb
                 row.Add(rb, 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 16)
-            row.Add(wx.StaticText(self, label="日期与时间的连接符："), 0,
+            row.Add(wx.StaticText(sb, label=tr("basic.timesep")), 0,
                     wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 4)
-            self.ctl["time_sep"] = wx.TextCtrl(self, size=(40, -1))
+            self.ctl["time_sep"] = wx.TextCtrl(sb, size=(40, -1))
             row.Add(self.ctl["time_sep"], 0, wx.ALIGN_CENTER_VERTICAL)
             sbs.Add(row, 0, wx.EXPAND | wx.ALL, 6)
             box.Add(sbs, 0, wx.EXPAND | wx.ALL, 8)
 
             # 分隔符与位置
-            sb = wx.StaticBox(self, label="日期与文件名的组合方式")
+            sb = wx.StaticBox(self, label=tr("basic.combine"))
             sbs = wx.StaticBoxSizer(sb, wx.VERTICAL)
             row = wx.BoxSizer(wx.HORIZONTAL)
-            row.Add(wx.StaticText(self, label="分隔符："), 0,
+            row.Add(wx.StaticText(sb, label=tr("basic.sep")), 0,
                     wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 4)
-            self.ctl["separator"] = wx.ComboBox(self, value=" ",
+            self.ctl["separator"] = wx.ComboBox(sb, value=" ",
                                                 choices=[" ", "_", "-", ".", ""])
             self.ctl["separator"].SetMinSize((60, -1))
             row.Add(self.ctl["separator"], 0, wx.RIGHT, 24)
-            row.Add(wx.StaticText(self, label="位置："), 0,
+            row.Add(wx.StaticText(sb, label=tr("basic.pos")), 0,
                     wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 4)
             self.ctl["position"] = {}
-            for val, label in (("prefix", "文件名前(前缀)"), ("suffix", "文件名后(后缀)")):
-                rb = wx.RadioButton(self, label=label, style=wx.RB_GROUP if val == "prefix" else 0)
+            for val, key in (("prefix", "pos.prefix"), ("suffix", "pos.suffix")):
+                rb = wx.RadioButton(sb, label=tr(key),
+                                    style=wx.RB_GROUP if val == "prefix" else 0)
                 self.ctl["position"][val] = rb
                 row.Add(rb, 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 12)
             sbs.Add(row, 0, wx.EXPAND | wx.ALL, 6)
             box.Add(sbs, 0, wx.EXPAND | wx.ALL, 8)
 
             # 运行方式
-            sb = wx.StaticBox(self, label="右键菜单的运行方式")
+            sb = wx.StaticBox(self, label=tr("basic.runmode"))
             sbs = wx.StaticBoxSizer(sb, wx.VERTICAL)
-            self.ctl["direct_mode"] = wx.CheckBox(self, label="直接执行（右键点击后立即重命名，不弹预览窗口）")
-            self.ctl["show_result"] = wx.CheckBox(self, label="执行后显示结果窗口（可撤销）")
+            self.ctl["direct_mode"] = wx.CheckBox(sb, label=tr("basic.direct"))
+            self.ctl["show_result"] = wx.CheckBox(sb, label=tr("basic.showresult"))
             sbs.Add(self.ctl["direct_mode"], 0, wx.ALL, 4)
             sbs.Add(self.ctl["show_result"], 0, wx.ALL, 4)
             box.Add(sbs, 0, wx.EXPAND | wx.ALL, 8)
 
             # 示例
-            sb = wx.StaticBox(self, label="效果示例（创建于 2015-10-10 14:30:05 的文件/文件夹）")
+            sb = wx.StaticBox(self, label=tr("basic.sample"))
             sbs = wx.StaticBoxSizer(sb, wx.VERTICAL)
-            self.sample_file = wx.StaticText(self, label="")
-            self.sample_dir = wx.StaticText(self, label="")
+            self.sample_file = wx.StaticText(sb, label="")
+            self.sample_dir = wx.StaticText(sb, label="")
             font = wx.Font(11, wx.FONTFAMILY_DEFAULT, wx.FONTSTYLE_NORMAL, wx.FONTWEIGHT_BOLD)
             self.sample_file.SetFont(font)
             self.sample_dir.SetFont(font)
@@ -925,23 +1051,33 @@ if wx is not None:
             box.Add(sbs, 0, wx.EXPAND | wx.ALL, 8)
 
             self.SetSizer(box)
+            self._sync_preset_choices()
+
+        def _sync_preset_choices(self):
+            """下拉框里显示当前语言下的示例文件名（切换语言后需重建）。"""
+            cb = self.ctl["date_format"]
+            cur = cb.GetValue()
+            cb.Set(format_preset_choices())
+            cb.SetValue(cur)
 
         def on_preset(self, event):
             """选择预设时，同步设置日期格式/时间/连接符。"""
+            choices = format_preset_choices()
             label = self.ctl["date_format"].GetValue()
-            for lbl, fmt, tmode, tsep in FORMAT_PRESETS:
-                if lbl == label:
-                    self.ctl["date_format"].SetValue(fmt)
-                    self.ctl["include_time"].get(tmode, self.ctl["include_time"]["none"]).SetValue(True)
-                    self.ctl["time_sep"].SetValue(tsep)
-                    break
+            if label in choices:
+                idx = choices.index(label)
+                fmt, tmode, tsep = FORMAT_PRESETS[idx]
+                self.ctl["date_format"].SetValue(fmt)
+                self.ctl["include_time"].get(
+                    tmode, self.ctl["include_time"]["none"]).SetValue(True)
+                self.ctl["time_sep"].SetValue(tsep)
             self.refresh_sample()
             event.Skip()
 
         def load(self, cfg):
             for val, rb in self.ctl["date_source"].items():
                 rb.SetValue(cfg.get("date_source") == val)
-            self.ctl["date_format"].SetValue(cfg.get("date_format", ""))
+            self.ctl["date_format"].SetValue(cfg.get("date_format", "%Y%m%d"))
             for val, rb in self.ctl["include_time"].items():
                 rb.SetValue(cfg.get("include_time") == val)
             self.ctl["time_sep"].SetValue(cfg.get("time_sep", "_"))
@@ -970,8 +1106,11 @@ if wx is not None:
         def refresh_sample(self):
             cfg = dict(load_config())
             self.collect(cfg)
-            self.sample_file.SetLabel("文件：某某文件.pdf  →  %s" % sample_new_name(cfg))
-            self.sample_dir.SetLabel("文件夹：项目资料  →  %s" % sample_new_name(cfg, "项目资料", True))
+            self.sample_file.SetLabel(i18n.tr(
+                "basic.sample.file", sample_file_name(), sample_new_name(cfg)))
+            self.sample_dir.SetLabel(i18n.tr(
+                "basic.sample.dir", sample_dir_name(),
+                sample_new_name(cfg, sample_dir_name(), True)))
 
     # ----------------------------- 高级设置页 -----------------------------
 
@@ -979,63 +1118,60 @@ if wx is not None:
         def __init__(self, parent):
             super().__init__(parent)
             self.ctl = {}
+            tr = i18n.tr
             box = wx.BoxSizer(wx.VERTICAL)
 
-            sb = wx.StaticBox(self, label="原文件名已包含日期前缀时")
+            sb = wx.StaticBox(self, label=tr("adv.existing"))
             sbs = wx.StaticBoxSizer(sb, wx.VERTICAL)
             self.ctl["existing_date"] = {}
-            for i, (val, label) in enumerate((
-                    ("skip", "跳过（推荐，避免重复添加日期）"),
-                    ("replace", "替换已有日期（去掉旧日期再加新日期）"),
-                    ("add", "仍然再添加一个"))):
-                rb = wx.RadioButton(self, label=label, style=wx.RB_GROUP if i == 0 else 0)
+            for i, (val, key) in enumerate((
+                    ("skip", "ex.skip"), ("replace", "ex.replace"), ("add", "ex.add"))):
+                rb = wx.RadioButton(sb, label=tr(key), style=wx.RB_GROUP if i == 0 else 0)
                 self.ctl["existing_date"][val] = rb
                 sbs.Add(rb, 0, wx.ALL, 4)
             box.Add(sbs, 0, wx.EXPAND | wx.ALL, 8)
 
-            sb = wx.StaticBox(self, label="新文件名已存在时")
+            sb = wx.StaticBox(self, label=tr("adv.conflict"))
             sbs = wx.StaticBoxSizer(sb, wx.VERTICAL)
             self.ctl["conflict"] = {}
-            for i, (val, label) in enumerate((
-                    ("suffix", "自动加序号：某某文件 (1).pdf"),
-                    ("skip", "跳过该文件"))):
-                rb = wx.RadioButton(self, label=label, style=wx.RB_GROUP if i == 0 else 0)
+            for i, (val, key) in enumerate((("suffix", "cf.suffix"), ("skip", "cf.skip"))):
+                rb = wx.RadioButton(sb, label=tr(key), style=wx.RB_GROUP if i == 0 else 0)
                 self.ctl["conflict"][val] = rb
                 sbs.Add(rb, 0, wx.ALL, 4)
             box.Add(sbs, 0, wx.EXPAND | wx.ALL, 8)
 
-            sb = wx.StaticBox(self, label="处理范围")
+            sb = wx.StaticBox(self, label=tr("adv.scope"))
             sbs = wx.StaticBoxSizer(sb, wx.VERTICAL)
             self.ctl["scope"] = {}
-            for i, (val, label) in enumerate((
-                    ("both", "文件和文件夹都处理"),
-                    ("files", "仅处理文件"),
-                    ("folders", "仅处理文件夹"))):
-                rb = wx.RadioButton(self, label=label, style=wx.RB_GROUP if i == 0 else 0)
+            for i, (val, key) in enumerate((
+                    ("both", "sc.both"), ("files", "sc.files"), ("folders", "sc.folders"))):
+                rb = wx.RadioButton(sb, label=tr(key), style=wx.RB_GROUP if i == 0 else 0)
                 self.ctl["scope"][val] = rb
                 sbs.Add(rb, 0, wx.ALL, 4)
-            self.ctl["recursive"] = wx.CheckBox(self, label="右键文件夹时，连同里面的子文件、子文件夹一起处理")
-            self.ctl["include_hidden"] = wx.CheckBox(self, label="包含隐藏/系统文件")
+            self.ctl["recursive"] = wx.CheckBox(sb, label=tr("adv.recursive"))
+            self.ctl["include_hidden"] = wx.CheckBox(sb, label=tr("adv.hidden"))
             sbs.Add(self.ctl["recursive"], 0, wx.ALL, 4)
             sbs.Add(self.ctl["include_hidden"], 0, wx.ALL, 4)
             box.Add(sbs, 0, wx.EXPAND | wx.ALL, 8)
 
-            sb = wx.StaticBox(self, label="序号")
+            sb = wx.StaticBox(self, label=tr("adv.seq"))
             sbs = wx.StaticBoxSizer(sb, wx.HORIZONTAL)
-            self.ctl["sequence"] = wx.CheckBox(self, label="在日期后追加序号")
+            self.ctl["sequence"] = wx.CheckBox(sb, label=tr("adv.seq.add"))
             sbs.Add(self.ctl["sequence"], 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 12)
-            sbs.Add(wx.StaticText(self, label="位数："), 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 4)
-            self.ctl["seq_digits"] = wx.TextCtrl(self, size=(40, -1))
+            sbs.Add(wx.StaticText(sb, label=tr("adv.seq.digits")), 0,
+                    wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 4)
+            self.ctl["seq_digits"] = wx.TextCtrl(sb, size=(40, -1))
             sbs.Add(self.ctl["seq_digits"], 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 12)
-            sbs.Add(wx.StaticText(self, label="连接符："), 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 4)
-            self.ctl["seq_sep"] = wx.TextCtrl(self, size=(40, -1))
+            sbs.Add(wx.StaticText(sb, label=tr("adv.seq.sep")), 0,
+                    wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 4)
+            self.ctl["seq_sep"] = wx.TextCtrl(sb, size=(40, -1))
             sbs.Add(self.ctl["seq_sep"], 0, wx.ALIGN_CENTER_VERTICAL)
             box.Add(sbs, 0, wx.EXPAND | wx.ALL, 8)
 
-            sb = wx.StaticBox(self, label="排除的扩展名（不处理这些文件）")
+            sb = wx.StaticBox(self, label=tr("adv.exclude"))
             sbs = wx.StaticBoxSizer(sb, wx.VERTICAL)
-            self.ctl["exclude_exts"] = wx.TextCtrl(self, value="")
-            self.ctl["exclude_exts"].SetHint("例如：.lnk, .tmp, .url（留空表示不排除）")
+            self.ctl["exclude_exts"] = wx.TextCtrl(sb, value="")
+            self.ctl["exclude_exts"].SetHint(tr("adv.exclude.hint"))
             sbs.Add(self.ctl["exclude_exts"], 0, wx.EXPAND | wx.ALL, 6)
             box.Add(sbs, 0, wx.EXPAND | wx.ALL, 8)
 
@@ -1082,42 +1218,37 @@ if wx is not None:
             super().__init__(parent)
             self.on_change = on_change
             self.ctl = {}
+            tr = i18n.tr
             box = wx.BoxSizer(wx.VERTICAL)
 
-            sb = wx.StaticBox(self, label="右键菜单")
+            sb = wx.StaticBox(self, label=tr("menu.box"))
             sbs = wx.StaticBoxSizer(sb, wx.VERTICAL)
             row = wx.BoxSizer(wx.HORIZONTAL)
-            row.Add(wx.StaticText(self, label="菜单显示文字："), 0,
+            row.Add(wx.StaticText(sb, label=tr("menu.text")), 0,
                     wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 4)
-            self.ctl["verb_text"] = wx.TextCtrl(self, size=(200, -1))
+            self.ctl["verb_text"] = wx.TextCtrl(sb, size=(200, -1))
+            self.ctl["verb_text"].SetHint(tr("verb.default"))
             row.Add(self.ctl["verb_text"], 1, wx.RIGHT, 12)
-            self.ctl["register_background"] = wx.CheckBox(
-                self, label="同时注册到“文件夹空白处”右键（对当前文件夹生效）")
+            self.ctl["register_background"] = wx.CheckBox(sb, label=tr("menu.bg"))
             row.Add(self.ctl["register_background"], 0, wx.ALIGN_CENTER_VERTICAL)
             sbs.Add(row, 0, wx.EXPAND | wx.ALL, 6)
 
             row = wx.BoxSizer(wx.HORIZONTAL)
-            self.btn_register = wx.Button(self, label="注册到右键菜单")
-            self.btn_unregister = wx.Button(self, label="从右键菜单移除")
-            self.btn_status = wx.Button(self, label="检查注册状态")
+            self.btn_register = wx.Button(sb, label=tr("menu.register"))
+            self.btn_unregister = wx.Button(sb, label=tr("menu.unregister"))
+            self.btn_status = wx.Button(sb, label=tr("menu.status"))
             row.Add(self.btn_register, 0, wx.RIGHT, 8)
             row.Add(self.btn_unregister, 0, wx.RIGHT, 8)
             row.Add(self.btn_status, 0)
             sbs.Add(row, 0, wx.LEFT | wx.RIGHT | wx.BOTTOM, 6)
 
-            self.status = wx.StaticText(self, label="")
-            self.status.SetForegroundColour(wx.Colour(0x60, 0x60, 0x60))
+            self.status = wx.StaticText(sb, label="")
+            self.status.SetForegroundColour(wx.Colour(*_GREY))
             sbs.Add(self.status, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 6)
             box.Add(sbs, 0, wx.EXPAND | wx.ALL, 8)
 
-            info = wx.StaticText(self, label=(
-                "说明：\n"
-                "· 注册写入当前用户注册表（HKCU\\Software\\Classes），不需要管理员权限；\n"
-                "· 注册目标为本程序当前位置（exe 或 pythonw + 脚本），移动程序后请重新注册；\n"
-                "· 资源管理器中多选文件/文件夹时，会一次性把所有选中项传给本程序批量处理；\n"
-                "· 修改“菜单显示文字”或“空白处”选项后，需要重新点击“注册到右键菜单”生效；\n"
-                "· 卸载：点击“从右键菜单移除”，然后删除本程序文件即可。"))
-            info.SetForegroundColour(wx.Colour(0x60, 0x60, 0x60))
+            info = wx.StaticText(self, label=tr("menu.info"))
+            info.SetForegroundColour(wx.Colour(*_GREY))
             box.Add(info, 0, wx.EXPAND | wx.ALL, 10)
 
             self.SetSizer(box)
@@ -1127,26 +1258,27 @@ if wx is not None:
             self.btn_status.Bind(wx.EVT_BUTTON, lambda e: self.refresh_status())
 
         def load(self, cfg):
-            self.ctl["verb_text"].SetValue(cfg.get("verb_text", DEFAULT_VERB_TEXT))
+            self.ctl["verb_text"].SetValue(cfg.get("verb_text", "") or "")
             self.ctl["register_background"].SetValue(bool(cfg.get("register_background")))
             self.refresh_status()
 
         def collect(self, cfg):
-            cfg["verb_text"] = self.ctl["verb_text"].GetValue().strip() or DEFAULT_VERB_TEXT
+            # 留空表示跟随界面语言（注册时由 default_verb_text() 决定）
+            cfg["verb_text"] = self.ctl["verb_text"].GetValue().strip()
             cfg["register_background"] = self.ctl["register_background"].GetValue()
 
         def refresh_status(self):
             st = registration_status()
-            labels = {"files": "文件菜单", "dirs": "文件夹菜单", "background": "空白处菜单"}
+            labels = {"files": "st.files", "dirs": "st.dirs", "background": "st.bg"}
             parts = []
             for k in ("files", "dirs", "background"):
                 if st.get(k):
-                    parts.append("%s:已注册" % labels[k])
+                    parts.append("%s:%s" % (i18n.tr(labels[k]), i18n.tr("st.on")))
                 elif k == "background":
                     continue
                 else:
-                    parts.append("%s:未注册" % labels[k])
-            self.status.SetLabel("当前状态 — " + "；".join(parts))
+                    parts.append("%s:%s" % (i18n.tr(labels[k]), i18n.tr("st.off")))
+            self.status.SetLabel(i18n.tr("menu.status.now", "  ".join(parts)))
 
         def on_register(self, event):
             cfg = dict(load_config())
@@ -1155,16 +1287,17 @@ if wx is not None:
             save_config(cfg)
             self.on_change()
             self.refresh_status()
+            tail = i18n.tr("menu.reg.ok") if ok else i18n.tr("menu.reg.fail")
             dlg = wx.MessageDialog(
-                self, "\n".join(msgs) + ("\n\n注册成功。" if ok else "\n\n注册失败。"),
-                "注册右键菜单", wx.OK | (wx.ICON_INFORMATION if ok else wx.ICON_ERROR))
+                self, "\n".join(msgs) + "\n\n" + tail, i18n.tr("menu.dlg.reg"),
+                wx.OK | (wx.ICON_INFORMATION if ok else wx.ICON_ERROR))
             dlg.ShowModal()
             dlg.Destroy()
 
         def on_unregister(self, event):
             ok, msgs = unregister_context_menu()
             self.refresh_status()
-            dlg = wx.MessageDialog(self, "\n".join(msgs), "移除右键菜单",
+            dlg = wx.MessageDialog(self, "\n".join(msgs), i18n.tr("menu.dlg.unreg"),
                                    wx.OK | (wx.ICON_INFORMATION if ok else wx.ICON_ERROR))
             dlg.ShowModal()
             dlg.Destroy()
@@ -1174,38 +1307,72 @@ if wx is not None:
     class UndoPage(_Page):
         def __init__(self, parent):
             super().__init__(parent)
+            tr = i18n.tr
             box = wx.BoxSizer(wx.VERTICAL)
+            self.ctl = {}
+
+            # 是否记录历史
+            self.ctl["record_history"] = wx.CheckBox(self, label=tr("undo.record"))
+            self.ctl["record_history"].Bind(wx.EVT_CHECKBOX, self.on_record_toggle)
+            box.Add(self.ctl["record_history"], 0, wx.LEFT | wx.RIGHT | wx.TOP, 8)
+
+            self.offline = wx.StaticText(self, label=tr("undo.offline"))
+            self.offline.SetForegroundColour(wx.Colour(*_GREY))
+            box.Add(self.offline, 0, wx.LEFT | wx.RIGHT | wx.TOP, 8)
+
             self.list = wx.ListCtrl(self, style=wx.LC_REPORT | wx.LC_SINGLE_SEL)
-            for i, (label, w) in enumerate((("时间", 180), ("项目数", 70), ("说明", 220))):
-                self.list.InsertColumn(i, label, width=w)
+            for i, (key, w) in enumerate(((("undo.col.time"), 180),
+                                          (("undo.col.count"), 70),
+                                          (("undo.col.desc"), 220))):
+                self.list.InsertColumn(i, tr(key), width=w)
             box.Add(self.list, 1, wx.EXPAND | wx.ALL, 8)
 
             row = wx.BoxSizer(wx.HORIZONTAL)
-            self.btn_undo = wx.Button(self, label="撤销选中批次")
-            self.btn_refresh = wx.Button(self, label="刷新列表")
+            self.btn_undo = wx.Button(self, label=tr("undo.btn"))
+            self.btn_clear = wx.Button(self, label=tr("undo.clear"))
+            self.btn_refresh = wx.Button(self, label=tr("undo.refresh"))
             row.Add(self.btn_undo, 0, wx.RIGHT, 8)
+            row.Add(self.btn_clear, 0, wx.RIGHT, 8)
             row.Add(self.btn_refresh, 0)
             box.Add(row, 0, wx.LEFT | wx.RIGHT | wx.BOTTOM, 8)
 
-            hint = wx.StaticText(self, label="提示：撤销会按相反顺序把文件名改回去；"
-                                             "若原文件名已被占用，该项会被跳过。")
-            hint.SetForegroundColour(wx.Colour(0x60, 0x60, 0x60))
+            hint = wx.StaticText(self, label=tr("undo.hint"))
+            hint.SetForegroundColour(wx.Colour(*_GREY))
             box.Add(hint, 0, wx.LEFT | wx.RIGHT | wx.BOTTOM, 8)
             self.SetSizer(box)
 
             self.btn_undo.Bind(wx.EVT_BUTTON, self.on_undo)
+            self.btn_clear.Bind(wx.EVT_BUTTON, self.on_clear)
             self.btn_refresh.Bind(wx.EVT_BUTTON, lambda e: self.refresh())
             self.refresh()
 
         def load(self, cfg):
+            self.ctl["record_history"].SetValue(bool(cfg.get("record_history", True)))
             self.refresh()
 
         def collect(self, cfg):
-            pass
+            cfg["record_history"] = self.ctl["record_history"].GetValue()
+
+        def on_record_toggle(self, event):
+            cfg = dict(load_config())
+            self.collect(cfg)
+            save_config(cfg)                      # 立即生效，无需点“保存设置”
+            self.refresh()
+            event.Skip()
 
         def refresh(self):
+            on = self.ctl["record_history"].GetValue()
+            hist = History() if on else None
+            n = len(hist.batches) if hist else 0
+            self.offline.Show(not on)
+            self.list.Show(on)
+            self.btn_undo.Enable(n > 0)
+            self.btn_clear.Enable(n > 0)
+            self.btn_refresh.Enable(on)
             self.list.DeleteAllItems()
-            hist = History()
+            if not on:
+                self.Layout()
+                return
             for idx, batch in enumerate(hist.batches):
                 pos = self.list.InsertItem(self.list.GetItemCount(), batch.get("time", ""))
                 self.list.SetItem(pos, 1, str(len(batch.get("items", []))))
@@ -1220,7 +1387,7 @@ if wx is not None:
         def on_undo(self, event):
             sel = self.list.GetFirstSelected()
             if sel < 0:
-                wx.MessageBox("请先选择要撤销的批次。", "提示")
+                wx.MessageBox(i18n.tr("undo.select"), i18n.tr("msg.tip"))
                 return
             idx = self.list.GetItemData(sel)
             hist = History()
@@ -1231,39 +1398,40 @@ if wx is not None:
             if err == 0:
                 hist.remove(idx)
             self.refresh()
-            wx.MessageBox("撤销完成：成功 %d 项，跳过 %d 项。" % (ok, err), "撤销")
+            wx.MessageBox(i18n.tr("undo.done", ok, err), i18n.tr("undo.btn"))
+
+        def on_clear(self, event):
+            hist = History()
+            if not hist.batches:
+                wx.MessageBox(i18n.tr("undo.norecord"), i18n.tr("msg.tip"))
+                return
+            dlg = wx.MessageDialog(
+                self, i18n.tr("undo.clear.ask", len(hist.batches)),
+                i18n.tr("undo.clear.title"), wx.YES_NO | wx.ICON_WARNING)
+            if dlg.ShowModal() != wx.ID_YES:
+                dlg.Destroy()
+                return
+            dlg.Destroy()
+            n = History().clear()
+            self.refresh()
+            wx.MessageBox(i18n.tr("undo.clear.done", n), i18n.tr("undo.clear.title"))
 
     # ----------------------------- 关于页 -----------------------------
 
     class AboutPage(_Page):
         def __init__(self, parent):
             super().__init__(parent)
+            tr = i18n.tr
             box = wx.BoxSizer(wx.VERTICAL)
-            text = wx.TextCtrl(self, style=wx.TE_MULTILINE | wx.TE_READONLY | wx.TE_AUTO_URL,
-                               value=(
-                "RenameTime 使用说明\n"
-                "====================\n\n"
-                "1. 注册：在“右键菜单”页点击【注册到右键菜单】。\n"
-                "   之后在资源管理器中选中文件/文件夹，右键即可看到菜单项。\n\n"
-                "2. 使用：选中一个或多个文件/文件夹 → 右键 → “添加日期前缀”。\n"
-                "   多选时一次性全部处理；混合选择文件和文件夹也可以。\n\n"
-                "3. 拖拽：把文件或文件夹拖到本窗口，可以先预览再执行。\n\n"
-                "4. 默认行为：文件名已包含日期前缀时会跳过，避免反复右键\n"
-                "   造成“20151010 20151010 某某.pdf”。如需替换旧日期，\n"
-                "   在“高级选项”里选择“替换已有日期”。\n\n"
-                "5. 撤销：每次批量重命名都会记录在“撤销”页，可整批还原。\n\n"
-                "6. 常见格式示例：\n"
-                "   20151010 某某.pdf        (%Y%m%d)\n"
-                "   2015-10-10 某某.pdf      (%Y-%m-%d)\n"
-                "   2015年10月10日 某某.pdf  (%Y年%m月%d日)\n"
-                "   20151010_1430 某某.pdf   (%Y%m%d + 时分)\n\n"
-                "7. 命令行：\n"
-                "   rename_time.exe --run 文件...   右键菜单调用\n"
-                "   rename_time.exe --register/--unregister/--status\n"
-                "   rename_time.exe --undo          撤销最近一批\n\n"
-                "8. 配置文件位置：%APPDATA%\\RenameTime\\config.json\n"))
-            box.Add(text, 1, wx.EXPAND | wx.ALL, 8)
+            self.text = wx.TextCtrl(self, style=wx.TE_MULTILINE | wx.TE_READONLY,
+                                    value="")
+            box.Add(self.text, 1, wx.EXPAND | wx.ALL, 8)
             self.SetSizer(box)
+            self.refresh()
+
+        def refresh(self):
+            self.text.SetValue("%s\n\n%s" % (
+                i18n.tr("about.version", APP_VERSION), i18n.tr("about.text")))
 
         def load(self, cfg):
             pass
@@ -1275,8 +1443,8 @@ if wx is not None:
 
     class SettingsFrame(wx.Frame):
         def __init__(self):
-            super().__init__(None, title="RenameTime — 文件日期重命名设置",
-                             size=(780, 700),
+            super().__init__(None, title=i18n.tr("title.settings"),
+                             size=(800, 720),
                              style=wx.DEFAULT_FRAME_STYLE & ~wx.MAXIMIZE_BOX)
             self.cfg = load_config()
             self.icon = None
@@ -1288,8 +1456,29 @@ if wx is not None:
             except Exception:
                 pass
 
+            self.lang_codes = [c for c, _n in i18n.LANGUAGES]
+            self._build()
+            self.Centre()
+
+        # ---- 界面构建（切换语言时整体重建）----
+
+        def _build(self):
+            self.SetTitle(i18n.tr("title.settings"))
             panel = wx.Panel(self)
+            self.panel = panel
             outer = wx.BoxSizer(wx.VERTICAL)
+
+            row0 = wx.BoxSizer(wx.HORIZONTAL)
+            row0.Add(wx.StaticText(panel, label=i18n.tr("basic.language")), 0,
+                     wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 6)
+            self.cb_lang = wx.ComboBox(
+                panel, choices=[n for _c, n in i18n.LANGUAGES], style=wx.CB_READONLY)
+            self.cb_lang.SetSelection(self.lang_codes.index(i18n.get_lang()))
+            row0.Add(self.cb_lang, 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 12)
+            lang_hint = wx.StaticText(panel, label=i18n.tr("basic.language.hint"))
+            lang_hint.SetForegroundColour(wx.Colour(*_GREY))
+            row0.Add(lang_hint, 0, wx.ALIGN_CENTER_VERTICAL)
+            outer.Add(row0, 0, wx.EXPAND | wx.ALL, 10)
 
             self.nb = wx.Notebook(panel)
             self.page_basic = BasicPage(self.nb)
@@ -1297,17 +1486,17 @@ if wx is not None:
             self.page_menu = MenuPage(self.nb, self.on_menu_change)
             self.page_undo = UndoPage(self.nb)
             self.page_about = AboutPage(self.nb)
-            self.nb.AddPage(self.page_basic, "基本设置")
-            self.nb.AddPage(self.page_adv, "高级选项")
-            self.nb.AddPage(self.page_menu, "右键菜单")
-            self.nb.AddPage(self.page_undo, "撤销")
-            self.nb.AddPage(self.page_about, "使用说明")
-            outer.Add(self.nb, 1, wx.EXPAND | wx.ALL, 8)
+            self.nb.AddPage(self.page_basic, i18n.tr("tab.basic"))
+            self.nb.AddPage(self.page_adv, i18n.tr("tab.advanced"))
+            self.nb.AddPage(self.page_menu, i18n.tr("tab.menu"))
+            self.nb.AddPage(self.page_undo, i18n.tr("tab.undo"))
+            self.nb.AddPage(self.page_about, i18n.tr("tab.about"))
+            outer.Add(self.nb, 1, wx.EXPAND | wx.LEFT | wx.RIGHT, 8)
 
             row = wx.BoxSizer(wx.HORIZONTAL)
-            self.btn_save = wx.Button(panel, label="保存设置")
-            self.btn_default = wx.Button(panel, label="恢复默认设置")
-            self.btn_close = wx.Button(panel, label="关闭")
+            self.btn_save = wx.Button(panel, label=i18n.tr("btn.save"))
+            self.btn_default = wx.Button(panel, label=i18n.tr("btn.default"))
+            self.btn_close = wx.Button(panel, label=i18n.tr("btn.close"))
             row.Add(self.btn_save, 0, wx.RIGHT, 8)
             row.Add(self.btn_default, 0, wx.RIGHT, 8)
             row.AddStretchSpacer()
@@ -1315,6 +1504,7 @@ if wx is not None:
             outer.Add(row, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 10)
             panel.SetSizer(outer)
 
+            self.cb_lang.Bind(wx.EVT_COMBOBOX, self.on_language_changed)
             self.btn_save.Bind(wx.EVT_BUTTON, self.on_save)
             self.btn_default.Bind(wx.EVT_BUTTON, self.on_default)
             self.btn_close.Bind(wx.EVT_BUTTON, lambda e: self.Close())
@@ -1331,7 +1521,6 @@ if wx is not None:
                 page.SetDropTarget(_FilesDropTarget(self))
 
             self.load_pages(self.cfg)
-            self.Centre()
 
         def _bind_change(self, page):
             """页面内任何控件变化都刷新效果示例。"""
@@ -1350,6 +1539,34 @@ if wx is not None:
                             wx.EVT_RADIOBUTTON, wx.EVT_CHECKBOX):
                     child.Bind(evt, refresh)
 
+        def on_language_changed(self, event):
+            idx = self.cb_lang.GetSelection()
+            if idx < 0:
+                return
+            code = self.lang_codes[idx]
+            if code == i18n.get_lang():
+                return
+            self.cfg = self.collect()
+            self.cfg["language"] = code
+            i18n.set_lang(code)
+            save_config(self.cfg)
+            self._rebuild()
+            event.Skip()
+
+        def _rebuild(self):
+            """按新语言重建整个界面。"""
+            old_panel = self.panel
+            old_nb = self.nb
+            sel = old_nb.GetSelection()
+            self._build()
+            try:
+                self.nb.SetSelection(sel)
+            except Exception:
+                pass
+            old_nb.Destroy()
+            old_panel.Destroy()
+            self.Layout()
+
         def load_pages(self, cfg):
             for page in (self.page_basic, self.page_adv, self.page_menu,
                          self.page_undo, self.page_about):
@@ -1358,6 +1575,7 @@ if wx is not None:
 
         def collect(self):
             cfg = dict(self.cfg)
+            cfg["language"] = i18n.get_lang()
             for page in (self.page_basic, self.page_adv, self.page_menu,
                          self.page_undo, self.page_about):
                 page.collect(cfg)
@@ -1368,12 +1586,15 @@ if wx is not None:
             self.cfg = self.collect()
             save_config(self.cfg)
             self.page_basic.refresh_sample()
-            wx.MessageBox("设置已保存。", "提示")
+            wx.MessageBox(i18n.tr("msg.saved"), i18n.tr("msg.tip"))
 
         def on_default(self, event):
             self.cfg = dict(DEFAULT_CONFIG)
+            self.cfg["language"] = i18n.get_lang()
+            i18n.set_lang(self.cfg["language"])
             self.load_pages(self.cfg)
             self.page_basic.refresh_sample()
+            save_config(self.cfg)
 
         def on_menu_change(self):
             self.cfg = self.collect()
@@ -1406,8 +1627,9 @@ if wx is not None:
 
     class PreviewFrame(wx.Frame):
         def __init__(self, paths, cfg, parent=None):
-            super().__init__(parent, title="RenameTime — 重命名预览",
-                             size=(860, 520),
+            tr = i18n.tr
+            super().__init__(parent, title=tr("title.preview"),
+                             size=(880, 520),
                              style=wx.DEFAULT_FRAME_STYLE & ~wx.MAXIMIZE_BOX)
             try:
                 ico = icon_path()
@@ -1422,21 +1644,21 @@ if wx is not None:
             panel = wx.Panel(self)
             outer = wx.BoxSizer(wx.VERTICAL)
 
-            tip = wx.StaticText(panel, label="点击行可勾选/取消；只处理勾选的项。")
-            tip.SetForegroundColour(wx.Colour(0x60, 0x60, 0x60))
+            tip = wx.StaticText(panel, label=tr("pv.tip"))
+            tip.SetForegroundColour(wx.Colour(*_GREY))
             outer.Add(tip, 0, wx.ALL, 8)
 
             self.list = wx.ListCtrl(panel, style=wx.LC_REPORT | wx.LC_SINGLE_SEL)
-            for i, (label, w) in enumerate((
-                    ("√", 34), ("原文件名", 230), ("新文件名", 260), ("说明", 220))):
+            for i, (label, w) in enumerate((("√", 34), (tr("pv.col.old"), 230),
+                                            (tr("pv.col.new"), 260), (tr("pv.col.reason"), 220))):
                 self.list.InsertColumn(i, label, width=w)
             outer.Add(self.list, 1, wx.EXPAND | wx.LEFT | wx.RIGHT, 8)
 
             row = wx.BoxSizer(wx.HORIZONTAL)
-            self.btn_all = wx.Button(panel, label="全选")
-            self.btn_none = wx.Button(panel, label="全不选")
-            self.btn_settings = wx.Button(panel, label="打开设置")
-            self.btn_exec = wx.Button(panel, label="执行重命名")
+            self.btn_all = wx.Button(panel, label=tr("pv.all"))
+            self.btn_none = wx.Button(panel, label=tr("pv.none"))
+            self.btn_settings = wx.Button(panel, label=tr("pv.settings"))
+            self.btn_exec = wx.Button(panel, label=tr("pv.exec.n", 0))
             self.btn_exec.SetForegroundColour(wx.Colour(0xC0, 0x30, 0x30))
             row.Add(self.btn_all, 0, wx.RIGHT, 8)
             row.Add(self.btn_none, 0, wx.RIGHT, 8)
@@ -1463,9 +1685,9 @@ if wx is not None:
                 pos = self.list.InsertItem(i, mark)
                 self.list.SetItem(pos, 1, pl["old_name"])
                 self.list.SetItem(pos, 2, pl["new_name"] or "—")
-                reason = pl["reason"]
+                reason = plan_reason(pl)
                 if pl["status"] == "ok" and not reason:
-                    reason = "待执行"
+                    reason = i18n.tr("pv.pending")
                 self.list.SetItem(pos, 3, reason)
                 if pl["status"] != "ok":
                     self.list.SetItemTextColour(pos, wx.Colour(0x99, 0x99, 0x99))
@@ -1475,7 +1697,7 @@ if wx is not None:
         def _update_exec_label(self):
             n = sum(1 for pl in self.plans
                     if pl["status"] == "ok" and pl.get("checked"))
-            self.btn_exec.SetLabel("执行重命名（%d）" % n)
+            self.btn_exec.SetLabel(i18n.tr("pv.exec.n", n))
 
         def _row_at(self, event):
             pos = event.GetPosition()
@@ -1515,11 +1737,11 @@ if wx is not None:
             n = sum(1 for pl in self.plans
                     if pl["status"] == "ok" and pl.get("checked"))
             if n == 0:
-                wx.MessageBox("没有勾选任何可执行的项目。", "提示")
+                wx.MessageBox(i18n.tr("pv.nothing"), i18n.tr("msg.tip"))
                 return
             dlg = wx.MessageDialog(
-                self, "即将重命名 %d 个项目，是否继续？\n（可在“撤销”页或结果窗口还原）" % n,
-                "确认执行", wx.YES_NO | wx.ICON_QUESTION)
+                self, i18n.tr("pv.confirm", n), i18n.tr("pv.confirm.title"),
+                wx.YES_NO | wx.ICON_QUESTION)
             if dlg.ShowModal() != wx.ID_YES:
                 dlg.Destroy()
                 return
@@ -1532,8 +1754,9 @@ if wx is not None:
 
     class ResultDialog(wx.Dialog):
         def __init__(self, parent, stats):
-            super().__init__(parent, title="RenameTime — 执行结果",
-                             size=(720, 460),
+            tr = i18n.tr
+            super().__init__(parent, title=tr("title.result"),
+                             size=(740, 460),
                              style=wx.DEFAULT_DIALOG_STYLE | wx.RESIZE_BORDER)
             try:
                 ico = icon_path()
@@ -1545,8 +1768,7 @@ if wx is not None:
 
             outer = wx.BoxSizer(wx.VERTICAL)
             summary = wx.StaticText(
-                self, label="成功 %d 项，跳过 %d 项，失败 %d 项。" % (
-                    stats["ok"], stats["skip"], stats["error"]))
+                self, label=tr("rs.summary", stats["ok"], stats["skip"], stats["error"]))
             summary.SetFont(wx.Font(11, wx.FONTFAMILY_DEFAULT,
                                     wx.FONTSTYLE_NORMAL, wx.FONTWEIGHT_BOLD))
             outer.Add(summary, 0, wx.ALL, 10)
@@ -1557,15 +1779,15 @@ if wx is not None:
                 if pl["status"] == "done":
                     lines.append("✓ %s  →  %s" % (pl["old_name"], pl["new_name"]))
                 elif pl["status"] == "error":
-                    lines.append("✗ %s ：%s" % (pl["old_name"], pl.get("reason", "")))
+                    lines.append("✗ %s ：%s" % (pl["old_name"], plan_reason(pl)))
                 else:
-                    lines.append("⊘ %s ：%s" % (pl["old_name"], pl.get("reason", "")))
-            self.text.SetValue("\n".join(lines) if lines else "（没有项目）")
+                    lines.append("⊘ %s ：%s" % (pl["old_name"], plan_reason(pl)))
+            self.text.SetValue("\n".join(lines) if lines else tr("rs.none"))
             outer.Add(self.text, 1, wx.EXPAND | wx.LEFT | wx.RIGHT, 10)
 
             row = wx.BoxSizer(wx.HORIZONTAL)
-            self.btn_undo = wx.Button(self, label="撤销这批重命名")
-            self.btn_close = wx.Button(self, label="关闭", id=wx.ID_CLOSE)
+            self.btn_undo = wx.Button(self, label=tr("rs.undo"))
+            self.btn_close = wx.Button(self, label=tr("rs.close"), id=wx.ID_CLOSE)
             row.Add(self.btn_undo, 0, wx.RIGHT, 8)
             row.AddStretchSpacer()
             row.Add(self.btn_close, 0)
@@ -1579,13 +1801,13 @@ if wx is not None:
         def on_undo(self, event):
             hist = History()
             if not hist.batches:
-                wx.MessageBox("没有可撤销的记录。", "提示")
+                wx.MessageBox(i18n.tr("undo.norecord"), i18n.tr("msg.tip"))
                 return
             batch = hist.batches[0]
             ok, err = undo_batch(batch)
             if err == 0:
                 hist.remove(0)
-            wx.MessageBox("撤销完成：成功 %d 项，跳过 %d 项。" % (ok, err), "撤销")
+            wx.MessageBox(i18n.tr("undo.done", ok, err), i18n.tr("undo.btn"))
             self.EndModal(wx.ID_OK)
 
 
@@ -1612,7 +1834,7 @@ def gui_run(paths):
             app = wx.App(False)
             ResultDialog(None, stats).ShowModal()
         else:
-            print("成功 %d，跳过 %d，失败 %d" % (stats["ok"], stats["skip"], stats["error"]))
+            print(i18n.tr("rs.summary", stats["ok"], stats["skip"], stats["error"]))
         return 0
     app = wx.App(False)
     PreviewFrame(paths, cfg).Show()
@@ -1656,15 +1878,12 @@ def notify_no_paths():
     """没有收到任何有效路径时给出明确提示（避免“点了没反应”）。"""
     append_launch_log("  警告：没有收到任何有效路径")
     if wx is None:
-        print("没有收到任何有效文件路径。")
+        print(i18n.tr("np.msg"))
         return
     try:
         app = wx.App(False)
-        wx.MessageBox(
-            "没有收到任何有效的文件路径。\n\n"
-            "如果你是从资源管理器右键点击的，说明右键菜单注册已失效，\n"
-            "请打开本程序 →「右键菜单」页 → 点击【注册到右键菜单】。",
-            "RenameTime", wx.OK | wx.ICON_WARNING)
+        wx.MessageBox(i18n.tr("np.msg"), i18n.tr("np.title"),
+                      wx.OK | wx.ICON_WARNING)
     except Exception:
         pass
 
@@ -1673,6 +1892,7 @@ def main(argv=None):
     _setup_console()
     append_launch_log("[%s] 启动 argv=%r" % (
         datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"), list(sys.argv)))
+    load_config()                # 读取配置并应用界面语言
     parser = argparse.ArgumentParser(
         prog=APP_NAME, description="Windows 右键菜单文件日期重命名工具")
     parser.add_argument("paths", nargs="*", help="要处理的文件/文件夹路径")
@@ -1693,21 +1913,21 @@ def main(argv=None):
         return 0 if ok else 1
     if args.status:
         st = registration_status()
-        labels = {"files": "所有文件的右键菜单", "dirs": "文件夹的右键菜单",
-                  "background": "文件夹空白处右键"}
-        for k, label in labels.items():
-            print("%s: %s" % (label, "已注册" if st.get(k) else "未注册"))
+        labels = {"files": "st.files", "dirs": "st.dirs", "background": "st.bg"}
+        for k, key in labels.items():
+            print("%s: %s" % (i18n.tr(key),
+                              i18n.tr("st.on" if st.get(k) else "st.off")))
         return 0
     if args.undo:
         hist = History()
         if not hist.batches:
-            print("没有可撤销的记录。")
+            print(i18n.tr("undo.norecord"))
             return 0
         batch = hist.batches[0]
         ok, err = undo_batch(batch)
         if err == 0:
             hist.remove(0)
-        print("撤销完成：成功 %d 项，跳过 %d 项。" % (ok, err))
+        print(i18n.tr("undo.done", ok, err))
         return 0
     if args.run:
         paths = normalize_paths(args.paths)
@@ -1730,7 +1950,7 @@ def main(argv=None):
             cfg = load_config()
             plans = build_plans(collect_targets(paths, cfg), cfg)
             stats = execute_plans(plans, cfg)
-            print("成功 %d，跳过 %d，失败 %d" % (stats["ok"], stats["skip"], stats["error"]))
+            print(i18n.tr("rs.summary", stats["ok"], stats["skip"], stats["error"]))
             return 0
         return gui_run(paths)
     if args.paths:
@@ -1739,7 +1959,7 @@ def main(argv=None):
             cfg = load_config()
             plans = build_plans(collect_targets(normalize_paths(args.paths), cfg), cfg)
             stats = execute_plans(plans, cfg)
-            print("成功 %d，跳过 %d，失败 %d" % (stats["ok"], stats["skip"], stats["error"]))
+            print(i18n.tr("rs.summary", stats["ok"], stats["skip"], stats["error"]))
             return 0
         return gui_run(normalize_paths(args.paths))
 

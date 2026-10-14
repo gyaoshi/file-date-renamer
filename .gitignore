@@ -13,8 +13,10 @@ test_sandbox/
 cli_test/
 shellexec_test/
 motw_test/
+gui_test/
 status_out.txt
 reg_out.txt
 
 # Agent 工作区数据（不属于项目源码）
 .workbuddy/
+exe_gui_test/
