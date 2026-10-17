@@ -18,8 +18,23 @@ After downloading, launch it once and click "Register to context menu".
 
 | Build | File | Size | Speed (1 file) | Notes |
 |---|---|---|---|---|
-| **Recommended** | `RenameTime-fast.zip` | 15 MB | **~1.6 s** | Unpacks to a folder containing `RenameTime.exe` plus an `_internal` directory. **Keep the whole folder together** — copying only the exe will not work |
-| Portable | `RenameTime.exe` | 15 MB | ~2 s | Single file, works anywhere, but re-extracts its runtime on every launch |
+| **Recommended** | `RenameTime-fast.zip` | 12 MB | **~1.6 s** | Unpacks to a folder containing `RenameTime.exe` plus an `_internal` directory. **Keep the whole folder together** — copying only the exe will not work |
+| Portable | `RenameTime.exe` | 12 MB | ~2 s | Single file, works anywhere, but re-extracts its runtime on every launch |
+
+## What's new in v1.3 — 15 MB down to 12 MB
+
+PyInstaller bundles libraries this program never uses. After verifying each is unreferenced in the source, they are now excluded:
+
+| Excluded module | Space saved | Why it was unused |
+|---|---|---|
+| `hashlib` / `_hashlib` | **7.6 MB** (`libcrypto-3-x64.dll`) | The program is offline; it does no cryptography |
+| `wx.html` | **1.3 MB** | The v1.0 HTML preview feature was dropped; zero references remain |
+| `email` | 20 modules | Pulled in transitively by `importlib.metadata`; this project ships its own i18n dictionary |
+| `gettext` / `tarfile` / `lzma` / `bz2` | ~0.3 MB | No `.tar`/`.xz`/`.bz2` reading, and i18n does not use gettext |
+
+Result: single-file exe **14.5 MB → 11.7 MB (-19%)**, folder build **40.3 MB → 31.0 MB (-23%)**, with no functional change (all 101 tests pass).
+
+> Of what remains, roughly 7 MB is wxWidgets and 6 MB is the Python interpreter — framework internals that cannot be trimmed further.
 
 > Since v1.2 the zip build is recommended: the single-file exe unpacks its dependencies to a
 > temp folder on every start, which costs about 1.5 extra seconds. The folder build loads

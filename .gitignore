@@ -1,9 +1,11 @@
 # 构建产物
 dist/
 build/
-*.spec
 __pycache__/
 *.pyc
+
+# 打包配置进版本库（体积优化依赖这份 excludes，误删会退化成 15MB 且可能启动崩溃）
+!RenameTime.spec
 
 # 主程序：以 Release 附件形式分发，不进版本库
 RenameTime.exe

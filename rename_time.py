@@ -50,7 +50,7 @@ import time
 import i18n
 
 APP_NAME = "RenameTime"
-APP_VERSION = "1.2.0"
+APP_VERSION = "1.3.0"
 VERB_KEY_NAME = "RenameTime"            # 注册表 verb 键名（保持 ASCII）
 MAX_HISTORY = 50
 
