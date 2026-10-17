@@ -50,7 +50,7 @@ import time
 import i18n
 
 APP_NAME = "RenameTime"
-APP_VERSION = "1.1.0"
+APP_VERSION = "1.2.0"
 VERB_KEY_NAME = "RenameTime"            # 注册表 verb 键名（保持 ASCII）
 MAX_HISTORY = 50
 
@@ -187,26 +187,98 @@ def read_queue():
         return []
 
 
-def try_become_leader():
-    """尝试成为批次主控进程（先到先得）。返回 True 表示本进程负责执行这一批。"""
-    lp = _lock_path()
-    try:                                    # 清理上次异常退出留下的过期锁
-        if time.time() - os.path.getmtime(lp) > 30:
-            os.remove(lp)
-    except OSError:
-        pass
+def take_queue():
+    """原子取走整个队列：把队列文件改名成自己专属的名字再读。
+
+    不能「读完再删」——两个动作之间若有进程投递，它的路径会被随后的删除
+    一起抹掉，而那个进程已经退出了，队列里的这条路径将永远无人处理，
+    对应文件就再也改不了名。改名是原子操作，投递方要么写进旧文件（被我们取走），
+    要么写进新建的队列文件（留下一轮继续处理），不会丢失。
+    """
+    mine = _queue_path() + ".%d" % os.getpid()
     try:
-        fd = os.open(lp, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        os.replace(_queue_path(), mine)      # 同一目录内 rename 是原子的
+    except OSError:
+        return []
+    try:
+        with open(mine, "r", encoding="utf-8") as f:
+            return [ln.strip() for ln in f if ln.strip()]
+    except OSError:
+        return []
+    finally:
         try:
-            os.write(fd, ("%d %s" % (os.getpid(),
-                                      datetime.datetime.now().isoformat())).encode("ascii"))
-        finally:
-            os.close(fd)
-        return True
-    except FileExistsError:
+            os.remove(mine)
+        except OSError:
+            pass
+
+
+def _pid_alive(pid):
+    """判断进程是否还活着。用于识别残留的批次锁。"""
+    if pid <= 0:
         return False
+    if os.name == "nt":
+        try:
+            import ctypes
+            PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+            STILL_ACTIVE = 259
+            k32 = ctypes.windll.kernel32
+            h = k32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+            if not h:
+                return False
+            try:
+                code = ctypes.c_ulong()
+                if not k32.GetExitCodeProcess(h, ctypes.byref(code)):
+                    return False
+                return code.value == STILL_ACTIVE
+            finally:
+                k32.CloseHandle(h)
+        except Exception:
+            return True             # 查不了就保守当作活着，避免两个主控并发
+    try:
+        os.kill(pid, 0)
+        return True
     except OSError:
         return False
+
+
+def _read_lock_pid(lp):
+    try:
+        with open(lp, "r", encoding="ascii") as f:
+            return int(f.readline().split()[0])
+    except (OSError, ValueError, IndexError):
+        return -1
+
+
+def try_become_leader():
+    """尝试成为批次主控进程（先到先得）。返回 True 表示本进程负责执行这一批。
+
+    锁文件里写着持有者的 PID。若锁存在但持有者进程已经不在（被强杀、崩溃、
+    任务管理器结束），这个锁就是残留的——必须立刻接管，否则后面所有进程都会
+    以为「已有主控」而只投递不执行，路径永远躺在队列里没人改。
+    """
+    lp = _lock_path()
+    for _ in range(3):
+        try:
+            fd = os.open(lp, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            try:
+                os.write(fd, ("%d %s" % (os.getpid(),
+                                          datetime.datetime.now().isoformat())).encode("ascii"))
+            finally:
+                os.close(fd)
+            return True
+        except FileExistsError:
+            holder = _read_lock_pid(lp)
+            stale = (holder > 0 and not _pid_alive(holder)) or \
+                    (holder <= 0 and time.time() - os.path.getmtime(lp) > 30)
+            if not stale:
+                return False
+            try:                    # 残留锁，清掉后重试抢占
+                os.remove(lp)
+            except OSError:
+                return False
+        except OSError:
+            return False
+    return False
 
 
 def _sibling_count():
@@ -251,38 +323,56 @@ def _sibling_count():
         try:
             pe = PROCESSENTRY32W()
             pe.dwSize = ctypes.sizeof(PROCESSENTRY32W)
-            mine = []                       # 自己这一家：自己 + 同名的父/子进程
-            others = 0
+            entries = []                     # 所有同类进程 (pid, ppid)，先收齐再判定
             if k32.Process32FirstW(snap, ctypes.byref(pe)):
                 while True:
-                    pid = int(pe.th32ProcessID)
-                    ppid = int(pe.th32ParentProcessID)
-                    same = pe.szExeFile.lower() == target
-                    if pid == me:
-                        mine.append(pid)
-                    elif same and (ppid == me or pid in mine):
-                        mine.append(pid)      # 父进程或子进程，同属一次调用
-                    elif same:
-                        others += 1
+                    if pe.szExeFile.lower() == target:
+                        entries.append((int(pe.th32ProcessID),
+                                        int(pe.th32ParentProcessID)))
                     if not k32.Process32NextW(snap, ctypes.byref(pe)):
                         break
-            return others
+            by_pid = dict(entries)
+
+            # 标记「自己这一家」：自己 + 同名父进程 + 同名子进程。
+            # 必须先收齐再判定：PID 小的先被枚举，onefile 派生的父进程一定排在
+            # 子进程之前，边遍历边判会漏掉父进程、把自己人当成还在启动的别人。
+            # 向上只认一层且必须是同类进程——各次调用的父进程都是 explorer.exe，
+            # 若无界上溯会把所有兄弟进程都算成自己人，反而永远等不到 0。
+            mine = {me}
+            parent = by_pid.get(me)
+            if parent is not None and parent in by_pid:
+                mine.add(parent)
+            changed = True
+            while changed:                    # 自己派生的子进程（多层保险）
+                changed = False
+                for pid, ppid in entries:
+                    if ppid in mine and pid not in mine:
+                        mine.add(pid)
+                        changed = True
+            return sum(1 for pid, _ppid in entries if pid not in mine)
         finally:
             k32.CloseHandle(snap)
     except Exception:
         return -1
 
 
-def collect_batch(quiet=1.0, cap=15.0):
+def collect_batch(quiet=0.35, cap=15.0, hold_lock=True):
     """主控进程：等待其它进程投递完毕后取走整批路径。
 
     资源管理器多选时每个文件各启动一个进程，这里等待“队列不再增长”一段时间，
-    收齐全部路径后清空队列与锁，返回整批路径。
+    收齐全部路径后原子取走队列，返回整批路径。
 
-    只靠“静默时间”不够：exe 冷启动要解压 2~3 秒，进程启动时刻天然离散，
-    队列可能中间静默超过 1 秒就被误判为结束。因此额外用 _sibling_count() 判断
-    是否还有同类进程正在启动——只要还有，就继续等（直到 cap 上限）。
-    个别进程启动过慢超出上限的，它们会在锁释放后自己成为下一批的主控，不会漏改。
+    结束条件（两者都要满足，缺一不可）：
+      1) 队列已静默 quiet 秒；
+      2) _sibling_count() <= 0，即没有别的同类进程还在启动。
+
+    为什么两个条件都要：资源管理器是逐个拉起进程的，第一个进程投递完并退出后，
+    后面几个可能还没被创建出来，此时队列确实“不再增长”，但批次远未收齐——
+    只看静默时间会漏改。只看进程数也不行：子进程退出与新进程创建之间存在空窗。
+
+    hold_lock 为 False 时不释放批次锁，由调用方决定何时放锁——主控必须在整个
+    聚合期间持有锁，否则后到的进程投递后会成为「跟随进程」直接退出，
+    而此时已无主控在处理它的路径，该文件就被漏掉了。
     """
     t0 = last_change = time.time()
     last_n = -1
@@ -291,18 +381,13 @@ def collect_batch(quiet=1.0, cap=15.0):
         now = time.time()
         if n != last_n:
             last_n, last_change = n, now
-        elif now - last_change >= quiet:
-            sib = _sibling_count()
-            if sib <= 0:          # 未知(-1)或确认只剩自己 → 可以执行
-                break
-            # 还有同类进程在启动，继续等；每0.5s 重查一次
-            if now - last_change >= quiet + 0.5:
-                last_change = now - quiet + 0.05
-        time.sleep(0.12)
-    paths = read_queue()
-    for p in (_queue_path(), _lock_path()):  # 先清空再执行，避免崩溃后残留
+        elif now - last_change >= quiet and _sibling_count() <= 0:
+            break
+        time.sleep(0.05)
+    paths = take_queue()          # 原子取走：期间新投递的路径会留在新队列里
+    if not hold_lock:
         try:
-            os.remove(p)
+            os.remove(_lock_path())
         except OSError:
             pass
     return normalize_paths(paths)
@@ -1935,13 +2020,55 @@ def main(argv=None):
             len(args.paths), len(paths), paths))
         # 资源管理器多选时会为每个文件各启动一个进程，这里聚合成一批统一处理
         if len(paths) == 1:
+            # 兜底：上一批的主控若被强杀/崩溃，队列里会残留无人认领的路径。
+            # 本进程若抢到锁就说明没有活着的控，顺便把残留的一并处理掉。
+            stale_left = len(read_queue())
             queue_paths(paths)
             if not try_become_leader():
                 append_launch_log("  聚合：本进程为跟随进程，已投递队列，退出")
                 return 0
-            paths = collect_batch()
-            append_launch_log("  聚合：本进程为批次主控，收齐 %d 个路径: %r" % (
-                len(paths), paths))
+            # 全程持有批次锁：中途放锁会让后到进程投递后成为「跟随进程」直接退出，
+            # 而此时已无主控处理它的路径，那个文件就被漏掉了。
+            # 这里循环接力，直到再取不到新路径为止，保证一个都不漏。
+            collected = []
+            for _round in range(6):
+                got = collect_batch()
+                if got:
+                    collected.extend(got)
+                    continue
+                if not read_queue():
+                    # 放锁前再等一小段：确认队列空与释放锁之间可能有进程投递，
+                    # 它会看到锁还在而当跟随进程退出，路径就永远留在队列里了。
+                    time.sleep(0.15)
+                    if not read_queue():
+                        break
+                    continue
+                time.sleep(0.05)    # 队列里还有东西（刚被别的进程投递），再收一轮
+            try:
+                os.remove(_lock_path())   # 确认收齐后才放锁
+            except OSError:
+                pass
+            # 放锁瞬间可能又挤进一个投递者，它会误判「已有主控」而退出。
+            # 这里回查一次并重新接管，把这批残留也处理掉。
+            for _late in range(3):
+                time.sleep(0.1)
+                leftover = read_queue()
+                if not leftover:
+                    break
+                if not try_become_leader():
+                    break            # 真有别人在处理，交给它
+                extra = collect_batch()
+                try:
+                    os.remove(_lock_path())
+                except OSError:
+                    pass
+                if not extra:
+                    break
+                collected.extend(extra)
+                append_launch_log("  聚合：补处理放锁瞬间挤入的 %d 个路径" % len(extra))
+            paths = normalize_paths(collected)
+            append_launch_log("  聚合：本进程为批次主控，收齐 %d 个路径（其中 %d 个是上一批残留）: %r" % (
+                len(paths), max(0, len(paths) - stale_left), paths))
         if not paths:
             notify_no_paths()
             return 0

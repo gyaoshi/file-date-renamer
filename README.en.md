@@ -13,8 +13,58 @@ Files and folders can be mixed, and a multi-selection is handled as a single bat
 
 ## Download
 
-Grab `RenameTime.exe` from **[Releases](../../releases)** (Windows 10/11, no Python needed).
+Grab it from **[Releases](../../releases)** (Windows 10/11, no Python needed).
 After downloading, launch it once and click "Register to context menu".
+
+| Build | File | Size | Speed (1 file) | Notes |
+|---|---|---|---|---|
+| **Recommended** | `RenameTime-fast.zip` | 15 MB | **~1.6 s** | Unpacks to a folder containing `RenameTime.exe` plus an `_internal` directory. **Keep the whole folder together** — copying only the exe will not work |
+| Portable | `RenameTime.exe` | 15 MB | ~2 s | Single file, works anywhere, but re-extracts its runtime on every launch |
+
+> Since v1.2 the zip build is recommended: the single-file exe unpacks its dependencies to a
+> temp folder on every start, which costs about 1.5 extra seconds. The folder build loads
+> directly and starts far quicker. Both builds are functionally identical.
+
+## What's new in v1.2 — 16.8 s down to 1.6 s
+
+**Renaming itself has always taken about 1 millisecond.** `os.rename` only edits the directory
+entry; it neither reads nor writes file contents, so even a 300 MB file renames in 0.8 ms.
+All the time went into startup overhead:
+
+| Stage | Cost |
+|---|---|
+| The actual rename | **1 ms** |
+| exe unpacking itself on launch (every single time) | ~1500 ms |
+| Batch aggregation wait (a flaw in the old logic) | ~15000 ms |
+
+Three fixes:
+
+1. **The aggregation wait idled for the full 15 seconds** (the main culprit). The old logic
+   declared a batch finished when the queue had been quiet for 1 second. But a PyInstaller
+   onefile exe needs ~1.5 s to unpack, so process starts are staggered: the first process had
+   already delivered its path and exited while the others had not even been created yet. That
+   looked like "batch over", so it idled until the 15 s cap. The condition is now **both**
+   "queue quiet for 0.35 s" **and** "no other process is still starting".
+2. **Switched to an onedir build** (the optional zip). onefile unpacks its whole runtime to a
+   temp directory on every launch (~1.5 s); onedir loads directly (~350 ms).
+3. **Fixed three races that could silently skip files** (occasionally a selected file was never
+   renamed):
+   - taking the queue changed from "read then delete" to an **atomic rename**, so a path arriving
+     during deletion is no longer wiped away with it;
+   - the leader now **holds the batch lock for its whole run**. Releasing it early let late
+     arrivals become followers and exit, leaving their path in the queue forever;
+   - the PID written into the lock file was never read. If the leader was killed, the lock
+     lingered for 30 s during which every process only delivered and none executed. It is now
+     checked for a live owner and taken over immediately.
+
+Measured end to end (right click to renamed, 12 benchmark runs, **zero skipped files**):
+
+| Files selected | v1.0 | v1.2 |
+|---|---|---|
+| 1 | 16.8 s | **1.6 s** |
+| 5 | 16.9 s | **1.6 s** |
+| 20 | 17.4 s | **2.5 s** |
+| 50 | 17.5 s | **4.9 s** |
 
 ## What's new in v1.1
 

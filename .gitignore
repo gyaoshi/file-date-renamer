@@ -7,6 +7,7 @@ __pycache__/
 
 # 主程序：以 Release 附件形式分发，不进版本库
 RenameTime.exe
+RenameTime-fast.zip
 
 # 测试临时目录
 test_sandbox/
@@ -20,3 +21,4 @@ reg_out.txt
 # Agent 工作区数据（不属于项目源码）
 .workbuddy/
 exe_gui_test/
+rt_bench/
